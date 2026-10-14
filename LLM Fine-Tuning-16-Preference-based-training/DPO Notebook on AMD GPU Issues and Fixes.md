@@ -6,7 +6,7 @@ Oct 14, 2026 · @Sridharan
 
 DPO training in `Preference_Aligned_Training_DPO_ollama.ipynb` now runs on the laptop's AMD Radeon GPU through torch-directml, using Qwen2.5-0.5B-Instruct. A verified run trained in about 9 seconds, then saved and merged the adapter. The 1.5B model still trains only on the CPU, because it crashes the GPU driver under DirectML.
 
-Nine separate problems stood between the original notebook and a working GPU run. Two were environment problems (a missing package and a stale kernel). Seven came from DirectML: the Hugging Face training stack was built for NVIDIA GPUs (CUDA) and the CPU only.
+Eleven separate problems came up. Four were environment or tooling problems (two missing packages, a stale kernel, and a hanging Ollama call). Seven came from DirectML: the Hugging Face training stack was built for NVIDIA GPUs (CUDA) and the CPU only.
 
 ## Environment
 
@@ -79,6 +79,18 @@ Each issue below lists the error as it appeared, the root cause, and the fix. Th
 - **Error:** `NotImplementedError: Cannot access storage of OpaqueTensorImpl`, in `trainer.save_model`.
 - **Cause:** safetensors reads tensor memory directly, which DirectML tensors don't expose.
 - **Fix:** move the trained model to the CPU before saving. The merge step also runs on the CPU.
+
+### 10. GGUF conversion fails with exit status 1
+
+- **Error:** `CalledProcessError: ... convert_hf_to_gguf.py ... returned non-zero exit status 1`. The notebook showed no reason.
+- **Cause:** running the converter directly showed `ModuleNotFoundError: No module named 'sentencepiece'`. llama.cpp's Qwen2 converter tries the SentencePiece tokenizer first and falls back to Qwen's real BPE tokenizer only when no SentencePiece file is found. Without the package installed, the import fails before that fallback can run.
+- **Fix:** installed `sentencepiece` 0.2.2 into `llms` and `llms-dml`, and added it to the install comments. The conversion cell now captures the converter's output and raises an error showing its stderr, so future failures show their cause. A test conversion of the 1.5B merged model produced a 3.1 GB F16 GGUF.
+
+### 11. Ollama smoke test hangs
+
+- **Symptom:** the smoke-test cell ran for over 6 minutes with no output.
+- **Cause:** when `ollama run` has no terminal, it also reads prompt text from stdin until stdin closes. The subprocess inherited the Jupyter kernel's stdin, which never closes, so it waited forever. `ollama ps` showed no model loaded, and the process was idle.
+- **Fix:** first tried `stdin=subprocess.DEVNULL`. That worked from a normal Python process but still hung inside the VS Code kernel, and the CLI's output contained terminal control codes. The cell now calls the Ollama server's HTTP API (`http://localhost:11434/api/generate`, `stream: false`) with `urllib`, so no CLI process is involved. It answers in about 5 seconds with clean text.
 
 ## Notebook changes
 
@@ -185,7 +197,7 @@ The final notebook ran end to end on the Radeon GPU, from setup through the merg
 | Tiny test model | tiny-Qwen2 | DirectML, FP32 and FP16 | Both trained after the fixes for issues 5 and 6 |
 | Original notebook | Qwen2.5-1.5B | CPU, FP32 (`llms` env) | Finished and saved an adapter, in your own run |
 
-Not yet run: the GGUF conversion and the Ollama cells. They don't depend on the GPU and are unchanged.
+The GGUF conversion was tested separately on the 1.5B merged model after issue 10 was fixed. The Ollama model was created, and the smoke test answered in about 5 seconds through the HTTP API (issue 11).
 
 ## Running it, limits and side effects
 
@@ -206,3 +218,47 @@ To train the 1.5B model, switch to the "llms" kernel. It runs on the CPU and is 
 - The preference dataset has only 5 pairs, so training proves the pipeline works, not that the model improved.
 
 **Side effect on the global Python:** before the notebook's kernel was identified, one install ran against the global Python 3.13. It replaced trl 1.14.2 with 0.26.2 and upgraded datasets from 3.6.0 to 5.0.1, plus huggingface-hub, tokenizers and fsspec (old versions not recorded). The notebook doesn't use that Python, but other projects might. trl and datasets can be put back on request.
+
+## The runs folder
+
+Each full run of the notebook writes one folder under `runs/`, named after the base model, and four notebook steps each add one part to it. The run behind today's Ollama model `pharma-qwen-dpo` is `runs/qwen2.5-1.5b-instruct-dpo`, written between 22:33 and 22:42 on Oct 14.
+
+&#91;embedded content: notebook steps and the files they write · 4 steps\]
+
+Only the adapter is unique: the merged model, the GGUF and the Ollama model are all rebuilt from it plus the base model.
+
+### Every file, by the step that creates it
+
+Paths are relative to `runs/qwen2.5-1.5b-instruct-dpo/`. Sizes are from that folder.
+
+| Step (cell) | File | Size | What it is |
+| --- | --- | --: | --- |
+| 1. Train | `adapter/adapter_model.safetensors` | 8.7 MB | The trained LoRA weights: 2,179,072 numbers in FP32. This is the actual result of DPO training. |
+| 1. Train | `adapter/adapter_config.json` | 1.2 KB | LoRA settings (`r=8`, `lora_alpha=16`, target layers `q/k/v/o_proj`) and the base model name, so PEFT knows how to attach the adapter. |
+| 1. Train | `adapter/training_args.bin` | 6.7 KB | The DPOConfig settings (learning rate, beta, batch size and so on), saved by the trainer. |
+| 1. Train | `adapter/README.md` | 5.2 KB | A model card template that PEFT generates automatically. |
+| 1. Train | `adapter/tokenizer.json`, `vocab.json`, `merges.txt`, `tokenizer_config.json`, `special_tokens_map.json`, `added_tokens.json`, `chat_template.jinja` | 15.9 MB | A copy of Qwen's tokenizer and chat template, from `tokenizer.save_pretrained`, so the adapter folder is self-contained. |
+| 2. Merge | `ollama-model/merged/model-00001-of-00002.safetensors`, `model-00002-of-00002.safetensors` | 6.2 GB | The full model with the LoRA weights added in, in FP32. Saved as two files (5.0 GB + 1.2 GB) because Hugging Face splits files over 5 GB. |
+| 2. Merge | `ollama-model/merged/model.safetensors.index.json` | 28 KB | Says which of the two files holds each weight. |
+| 2. Merge | `ollama-model/merged/config.json` | 1.4 KB | The model architecture: number of layers, hidden size, vocabulary size. |
+| 2. Merge | `ollama-model/merged/generation_config.json` | 256 B | Default text-generation settings. |
+| 2. Merge | `ollama-model/merged/` tokenizer files | 15.9 MB | The same tokenizer copy again, so the merged model can be loaded or converted on its own. |
+| 3. Convert | `pharma-qwen-dpo-f16.gguf` | 3.1 GB | The merged model as one GGUF file, the format llama.cpp and Ollama read. F16 halves the size of the FP32 merge. Weights, tokenizer and chat template are all inside. |
+| 4. Ollama create | `Modelfile` | 276 B | Ollama's recipe: `FROM` the GGUF path, `temperature 0.2`, and the system prompt. `ollama create` reads it and copies the GGUF into Ollama's own store, `C:\Users\sridh\.ollama\models\blobs`. |
+
+The smoke-test cell creates no files. The trainer's `output_dir` points at the same folder, but `save_strategy="no"` stops it writing checkpoints there.
+
+### The second folder, qwen2.5-1.5b-dpo
+
+`runs/qwen2.5-1.5b-dpo` comes from before the folder name was changed to include the full model name. It has the same layout, but its parts don't match each other. Its adapter was saved at 22:07 by the CPU run after the trl fix, while its merged model and GGUF date from 20:57 to 20:59, so they were built from an earlier adapter. Ollama doesn't use it. A DirectML run would add a third folder, `runs/qwen2.5-0.5b-instruct-dpo`.
+
+### What can be deleted
+
+The two folders take 8.7 GB each, 17.4 GB in total.
+
+| Item | Size | Safe to delete? |
+| --- | --: | --- |
+| `runs/qwen2.5-1.5b-dpo` (whole folder) | 8.7 GB | Yes. It's outdated and not used by Ollama. |
+| `ollama-model/merged/` in the current run | 6.2 GB | Yes. The merge cell rebuilds it from the adapter and the base model in a few minutes. |
+| `pharma-qwen-dpo-f16.gguf` in the current run | 3.1 GB | Yes. Ollama keeps its own copy, so `pharma-qwen-dpo` keeps working. You'd only need it to run `ollama create` again. |
+| `adapter/` in the current run | 25 MB | No. It's the training result; everything else is rebuilt from it. |
